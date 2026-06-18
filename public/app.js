@@ -13,34 +13,30 @@ function setStatus(message) {
   statusEl.textContent = message;
 }
 
-function extractUntappdBeers(rows) {
-  return rows
-    .map(row => {
-      const beer =
-        row.beer_name ||
-        row["Beer Name"] ||
-        row.beer ||
-        row.Name ||
-        row.name;
+function findBeerNameColumn(headers) {
+  const normalized = headers.map(h => ({
+    original: h,
+    normalized: h
+      .toLowerCase()
+      .trim()
+      .replace(/\s+/g, "_")
+      .replace(/-/g, "_")
+  }));
 
-      const brewery =
-        row.brewery_name ||
-        row["Brewery Name"] ||
-        row.brewery ||
-        row.Brewery;
+  const possibleNames = [
+    "beer_name",
+    "beer",
+    "name",
+    "beername",
+    "product_name",
+    "title"
+  ];
 
-      if (!beer) return null;
+  const match = normalized.find(h =>
+    possibleNames.includes(h.normalized)
+  );
 
-      return {
-        beerName: beer.trim(),
-        breweryName: brewery ? brewery.trim() : "",
-        searchKey: `${beer} ${brewery || ""}`
-          .toLowerCase()
-          .replace(/[^\w\s]/g, "")
-          .trim()
-      };
-    })
-    .filter(Boolean);
+  return match ? match.original : null;
 }
 
 function normalizeBeerName(value) {
