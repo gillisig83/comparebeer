@@ -1,0 +1,17 @@
+{
+  "name": "untappd-beer-compare-netlify",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Compare an Untappd CSV export against beers listed on a retailer page.",
+  "scripts": {
+    "dev": "netlify dev",
+    "start": "netlify dev"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0",
+    "papaparse": "^5.5.3"
+  },
+  "devDependencies": {
+    "netlify-cli": "^17.38.1"
+  }
+}
