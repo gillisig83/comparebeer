@@ -223,3 +223,22 @@ button:disabled {
     height: 180px;
   }
 }
+
+.missing-image {
+  width: 96px;
+  height: 96px;
+  display: grid;
+  place-items: center;
+  border-radius: 14px;
+  background: #080604;
+  color: var(--muted);
+  font-size: 0.85rem;
+  text-align: center;
+}
+
+@media (max-width: 560px) {
+  .missing-image {
+    width: 100%;
+    height: 180px;
+  }
+}
