@@ -18,7 +18,7 @@ async function handleCompare() {
   clearResults();
 
   const file = csvFileInput.files[0];
-  const shopUrl = shopUrlInput.value.trim();
+  let shopUrl = shopUrlInput.value.trim();
 
   if (!file) {
     showError("Choose your Untappd CSV file first.");
@@ -30,24 +30,28 @@ async function handleCompare() {
     return;
   }
 
+  /*
+    Vínbúðin /heim/vorur is mostly a category/menu page.
+    The real product list is usually /heim/vorur/vorur.
+  */
+  if (shopUrl === "https://www.vinbudin.is/heim/vorur") {
+    shopUrl = "https://www.vinbudin.is/heim/vorur/vorur";
+    shopUrlInput.value = shopUrl;
+  }
+
   try {
     compareBtn.disabled = true;
+
     setStatus("Reading Untappd CSV...");
-
     const ratedBeers = await parseUntappdCsv(file);
-
     ratedCountEl.textContent = ratedBeers.length;
 
     setStatus("Fetching beer shop page...");
-
     const siteBeers = await fetchBeersFromSite(shopUrl);
-
     siteCountEl.textContent = siteBeers.length;
 
     setStatus("Comparing beers...");
-
     const notTasted = findNotTastedBeers(siteBeers, ratedBeers);
-
     notTastedCountEl.textContent = notTasted.length;
 
     renderResults(notTasted);
@@ -61,9 +65,10 @@ async function handleCompare() {
   }
 }
 
-/**
- * Parses Untappd CSV export.
- */
+/* -----------------------------
+   CSV PARSING
+----------------------------- */
+
 function parseUntappdCsv(file) {
   return new Promise((resolve, reject) => {
     Papa.parse(file, {
@@ -75,7 +80,7 @@ function parseUntappdCsv(file) {
         const headers = results.meta.fields || [];
 
         console.log("CSV headers:", headers);
-        console.log("First row:", rows[0]);
+        console.log("First CSV row:", rows[0]);
 
         if (!headers.length) {
           reject(new Error("No CSV headers found. Is this a real CSV export?"));
@@ -134,9 +139,6 @@ function parseUntappdCsv(file) {
   });
 }
 
-/**
- * Finds a matching column, ignoring case, spaces, underscores and hyphens.
- */
 function findColumn(headers, possibleNames) {
   const normalizedPossibleNames = possibleNames.map(normalizeHeader);
 
@@ -152,9 +154,10 @@ function normalizeHeader(value) {
     .replace(/[\s_-]+/g, "");
 }
 
-/**
- * Fetches the site HTML through a Netlify function to avoid CORS.
- */
+/* -----------------------------
+   SITE FETCHING
+----------------------------- */
+
 async function fetchBeersFromSite(url) {
   const response = await fetch(
     `/.netlify/functions/fetch-page?url=${encodeURIComponent(url)}`
@@ -173,75 +176,203 @@ async function fetchBeersFromSite(url) {
   return extractBeersFromHtml(data.html, url);
 }
 
-/**
- * Extracts beer/product cards from HTML.
- *
- * This is intentionally broad because shops structure pages differently.
- */
+/* -----------------------------
+   HTML PRODUCT EXTRACTION
+----------------------------- */
+
 function extractBeersFromHtml(html, pageUrl) {
   const parser = new DOMParser();
   const doc = parser.parseFromString(html, "text/html");
 
-  const candidates = [];
+  const host = getHost(pageUrl);
 
-  /**
-   * Generic product title selectors.
-   * Add more here if a shop uses different class names.
-   */
-  const selectors = [
-    "h1",
-    "h2",
-    "h3",
-    ".product-title",
-    ".product-name",
-    ".product__title",
-    ".product-card",
-    ".product",
-    ".card",
-    "article",
-    "a"
+  if (host.includes("vinbudin.is")) {
+    return extractVinbudinProducts(doc, pageUrl);
+  }
+
+  return extractGenericShopProducts(doc, pageUrl);
+}
+
+/*
+  Vínbúðin fix:
+  Only collect actual product links.
+
+  Product links usually contain:
+  stoek-vara.aspx/?productid=...
+*/
+function extractVinbudinProducts(doc, pageUrl) {
+  const products = [];
+
+  const productLinks = Array.from(
+    doc.querySelectorAll('a[href*="stoek-vara"], a[href*="productid"]')
+  );
+
+  productLinks.forEach((link) => {
+    const href = link.getAttribute("href");
+    if (!href) return;
+
+    const productUrl = makeAbsoluteUrl(href, pageUrl);
+
+    const productId = getProductId(productUrl);
+    if (!productId) return;
+
+    const container =
+      link.closest("tr") ||
+      link.closest("li") ||
+      link.closest("article") ||
+      link.closest(".product") ||
+      link.closest(".product-item") ||
+      link.closest(".product-list-item") ||
+      link.parentElement;
+
+    const rawText = cleanText(
+      container?.textContent || link.textContent || ""
+    );
+
+    const name = extractVinbudinProductName(rawText, link.textContent, productId);
+
+    if (!name) return;
+
+    const image = findImageNearElement(container || link, pageUrl);
+
+    products.push({
+      name,
+      brewery: "",
+      url: productUrl,
+      image,
+      productId,
+      key: createBeerKey(name, ""),
+      nameKey: normalizeForCompare(name)
+    });
+  });
+
+  return dedupeProducts(products);
+}
+
+function extractVinbudinProductName(containerText, linkText, productId) {
+  let value = cleanText(linkText);
+
+  if (!value || value.length < 3) {
+    value = cleanText(containerText);
+  }
+
+  if (!value) return null;
+
+  /*
+    Remove obvious menu junk.
+  */
+  const lower = value.toLowerCase();
+
+  const badValues = [
+    "loka",
+    "opnunartímar",
+    "vörur",
+    "allar vörur",
+    "bjór",
+    "vefbúð",
+    "leit",
+    "karfa",
+    "innskráning",
+    "forsíða",
+    "næsta síða",
+    "fyrri síða"
   ];
 
-  selectors.forEach((selector) => {
+  if (badValues.includes(lower)) {
+    return null;
+  }
+
+  /*
+    Product names often appear like:
+    Duvel (08114)
+    or inside a longer text block.
+
+    Try to grab the part before product number.
+  */
+  const idPattern = new RegExp(`(.+?)\\(?${escapeRegExp(productId)}\\)?`);
+  const idMatch = value.match(idPattern);
+
+  if (idMatch && idMatch[1]) {
+    value = idMatch[1];
+  }
+
+  /*
+    Remove price, volume, ABV and product number noise.
+  */
+  value = value
+    .replace(/\(\d{4,8}\)/g, "")
+    .replace(/\b\d{4,8}\b/g, "")
+    .replace(/\b\d+[,.]?\d*\s?%.*$/i, "")
+    .replace(/\b\d+\s?(ml|cl|l|lítrar)\b.*$/i, "")
+    .replace(/\b\d+[,.]?\d*\s?kr\.?.*$/i, "")
+    .replace(/\bverð\b.*$/i, "")
+    .replace(/\bprice\b.*$/i, "")
+    .trim();
+
+  /*
+    If the text block has many words from the whole product card,
+    keep only the first line-ish part.
+  */
+  value = value
+    .split("  ")
+    .map(cleanText)
+    .filter(Boolean)[0] || value;
+
+  if (value.length < 3 || value.length > 90) {
+    return null;
+  }
+
+  return value;
+}
+
+/*
+  Fallback for other shops.
+  This is stricter than the old one:
+  it does NOT collect every menu link.
+*/
+function extractGenericShopProducts(doc, pageUrl) {
+  const products = [];
+
+  const productSelectors = [
+    ".product",
+    ".product-card",
+    ".product-item",
+    ".product-list-item",
+    "[class*='product']",
+    "article"
+  ];
+
+  productSelectors.forEach((selector) => {
     doc.querySelectorAll(selector).forEach((element) => {
       const text = cleanText(element.textContent);
+      const name = extractGenericProductName(text);
 
-      if (!text) return;
+      if (!name) return;
 
-      const possibleBeer = extractLikelyBeerName(text);
+      const url = findClosestLink(element, pageUrl);
+      const image = findImageNearElement(element, pageUrl);
 
-      if (!possibleBeer) return;
-
-      const link = findClosestLink(element, pageUrl);
-      const image = findClosestImage(element, pageUrl);
-
-      candidates.push({
-        name: possibleBeer,
+      products.push({
+        name,
         brewery: "",
-        url: link,
+        url,
         image,
-        key: createBeerKey(possibleBeer, ""),
-        nameKey: normalizeForCompare(possibleBeer)
+        key: createBeerKey(name, ""),
+        nameKey: normalizeForCompare(name)
       });
     });
   });
 
-  const unique = dedupeBeers(candidates);
-
-  return unique;
+  return dedupeProducts(products);
 }
 
-/**
- * Tries to remove shop noise and keep likely product names.
- */
-function extractLikelyBeerName(text) {
+function extractGenericProductName(text) {
   let value = cleanText(text);
 
   if (!value) return null;
 
-  /**
-   * Reject obvious non-product junk.
-   */
+  const lower = value.toLowerCase();
+
   const badWords = [
     "choose file",
     "compare beers",
@@ -255,19 +386,15 @@ function extractLikelyBeerName(text) {
     "cookie",
     "terms",
     "footer",
-    "header"
+    "header",
+    "opening hours",
+    "opnunartímar"
   ];
-
-  const lower = value.toLowerCase();
 
   if (badWords.some((word) => lower.includes(word))) {
     return null;
   }
 
-  /**
-   * Many product cards include too much text.
-   * Keep the first sensible line.
-   */
   const lines = value
     .split(/\n| {2,}/)
     .map(cleanText)
@@ -277,81 +404,23 @@ function extractLikelyBeerName(text) {
     value = lines[0];
   }
 
-  /**
-   * Reject very short or absurdly long strings.
-   */
-  if (value.length < 3 || value.length > 120) {
-    return null;
-  }
-
-  /**
-   * Product pages often include ABV, volume, price etc.
-   * That is fine, but we clean some common endings.
-   */
   value = value
     .replace(/\b\d+[,.]?\d*\s?%.*$/i, "")
     .replace(/\b\d+\s?(ml|cl|l)\b.*$/i, "")
     .replace(/\b\d+[,.]?\d*\s?kr\.?.*$/i, "")
     .trim();
 
-  if (value.length < 3) return null;
+  if (value.length < 3 || value.length > 90) {
+    return null;
+  }
 
   return value;
 }
 
-function findClosestLink(element, pageUrl) {
-  const linkElement = element.closest("a") || element.querySelector?.("a");
+/* -----------------------------
+   COMPARISON
+----------------------------- */
 
-  if (!linkElement) {
-    return pageUrl;
-  }
-
-  const href = linkElement.getAttribute("href");
-
-  if (!href) {
-    return pageUrl;
-  }
-
-  try {
-    return new URL(href, pageUrl).href;
-  } catch {
-    return pageUrl;
-  }
-}
-
-function findClosestImage(element, pageUrl) {
-  const container =
-    element.closest("article") ||
-    element.closest(".product") ||
-    element.closest(".product-card") ||
-    element.closest(".card") ||
-    element.parentElement;
-
-  const img = container?.querySelector?.("img");
-
-  if (!img) {
-    return "";
-  }
-
-  const src =
-    img.getAttribute("src") ||
-    img.getAttribute("data-src") ||
-    img.getAttribute("data-lazy-src");
-
-  if (!src) {
-    return "";
-  }
-
-  try {
-    return new URL(src, pageUrl).href;
-  } catch {
-    return "";
-  }
-}
-
-/**
- * Compares site beers against tasted Untappd beers.
- */
 function findNotTastedBeers(siteBeers, ratedBeers) {
   const ratedNameKeys = new Set(ratedBeers.map((beer) => beer.nameKey));
   const ratedFullKeys = new Set(ratedBeers.map((beer) => beer.key));
@@ -360,10 +429,6 @@ function findNotTastedBeers(siteBeers, ratedBeers) {
     if (ratedNameKeys.has(siteBeer.nameKey)) return false;
     if (ratedFullKeys.has(siteBeer.key)) return false;
 
-    /**
-     * Fuzzy-ish fallback:
-     * If one name contains the other, count it as tasted.
-     */
     const siteName = siteBeer.nameKey;
 
     const closeMatch = ratedBeers.some((ratedBeer) => {
@@ -371,62 +436,23 @@ function findNotTastedBeers(siteBeers, ratedBeers) {
 
       if (!ratedName || !siteName) return false;
 
-      return (
-        ratedName.includes(siteName) ||
-        siteName.includes(ratedName)
-      );
+      return ratedName.includes(siteName) || siteName.includes(ratedName);
     });
 
     return !closeMatch;
   });
 }
 
-function dedupeBeers(beers) {
-  const seen = new Set();
-  const unique = [];
-
-  beers.forEach((beer) => {
-    const key = beer.nameKey;
-
-    if (!key || seen.has(key)) return;
-
-    seen.add(key);
-    unique.push(beer);
-  });
-
-  return unique;
-}
-
-function createBeerKey(name, brewery) {
-  return normalizeForCompare(`${name} ${brewery || ""}`);
-}
-
-function normalizeForCompare(value) {
-  return String(value || "")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/ð/g, "d")
-    .replace(/þ/g, "th")
-    .replace(/æ/g, "ae")
-    .replace(/ö/g, "o")
-    .replace(/[^a-z0-9]+/g, " ")
-    .replace(/\b(beer|ale|lager|ipa|stout|porter|can|bottle|draught)\b/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function cleanText(value) {
-  return String(value || "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
+/* -----------------------------
+   RENDERING
+----------------------------- */
 
 function renderResults(beers) {
   resultsEl.innerHTML = "";
 
   if (!beers.length) {
-    resultsEl.innerHTML = `<p class="empty">No new beers found. Either you have tasted them all, or the site is hiding the beer names like a goblin.</p>`;
+    resultsEl.innerHTML =
+      `<p class="empty">No new beers found. Either you have tasted them all, or the page did not expose product data.</p>`;
     return;
   }
 
@@ -436,7 +462,7 @@ function renderResults(beers) {
 
     const imageHtml = beer.image
       ? `<img src="${escapeHtml(beer.image)}" alt="${escapeHtml(beer.name)}" loading="lazy" />`
-      : `<img src="" alt="" />`;
+      : `<div class="missing-image">No image</div>`;
 
     card.innerHTML = `
       ${imageHtml}
@@ -455,6 +481,122 @@ function renderResults(beers) {
 
     resultsEl.appendChild(card);
   });
+}
+
+/* -----------------------------
+   HELPERS
+----------------------------- */
+
+function dedupeProducts(products) {
+  const seen = new Set();
+  const unique = [];
+
+  products.forEach((product) => {
+    const key = product.productId || product.nameKey;
+
+    if (!key || seen.has(key)) return;
+
+    seen.add(key);
+    unique.push(product);
+  });
+
+  return unique;
+}
+
+function getProductId(url) {
+  try {
+    const parsed = new URL(url);
+    const productId = parsed.searchParams.get("productid");
+
+    if (productId) {
+      return productId.replace(/\D/g, "");
+    }
+
+    const match = url.match(/productid=([0-9]+)/i);
+    return match ? match[1] : "";
+  } catch {
+    const match = String(url).match(/productid=([0-9]+)/i);
+    return match ? match[1] : "";
+  }
+}
+
+function findClosestLink(element, pageUrl) {
+  const linkElement = element.closest?.("a") || element.querySelector?.("a");
+
+  if (!linkElement) {
+    return pageUrl;
+  }
+
+  const href = linkElement.getAttribute("href");
+
+  if (!href) {
+    return pageUrl;
+  }
+
+  return makeAbsoluteUrl(href, pageUrl);
+}
+
+function findImageNearElement(element, pageUrl) {
+  if (!element) return "";
+
+  const img =
+    element.querySelector?.("img") ||
+    element.closest?.("article")?.querySelector?.("img") ||
+    element.closest?.(".product")?.querySelector?.("img") ||
+    element.closest?.(".product-item")?.querySelector?.("img");
+
+  if (!img) return "";
+
+  const src =
+    img.getAttribute("src") ||
+    img.getAttribute("data-src") ||
+    img.getAttribute("data-lazy-src") ||
+    img.getAttribute("data-original");
+
+  if (!src) return "";
+
+  return makeAbsoluteUrl(src, pageUrl);
+}
+
+function makeAbsoluteUrl(value, baseUrl) {
+  try {
+    return new URL(value, baseUrl).href;
+  } catch {
+    return baseUrl;
+  }
+}
+
+function getHost(url) {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function createBeerKey(name, brewery) {
+  return normalizeForCompare(`${name} ${brewery || ""}`);
+}
+
+function normalizeForCompare(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/ð/g, "d")
+    .replace(/þ/g, "th")
+    .replace(/æ/g, "ae")
+    .replace(/ö/g, "o")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\b(beer|ale|lager|ipa|stout|porter|can|bottle|draught|dose|flaska)\b/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function cleanText(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function clearResults() {
@@ -486,4 +628,8 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
-    }
+}
+
+function escapeRegExp(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
