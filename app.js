@@ -18,7 +18,7 @@ async function handleCompare() {
   clearResults();
 
   const file = csvFileInput.files[0];
-  let shopUrl = shopUrlInput.value.trim();
+  const shopUrl = shopUrlInput.value.trim();
 
   if (!file) {
     showError("Choose your Untappd CSV file first.");
@@ -30,15 +30,6 @@ async function handleCompare() {
     return;
   }
 
-  /*
-    Vínbúðin /heim/vorur is mostly a category/menu page.
-    The real product list is usually /heim/vorur/vorur.
-  */
-  if (shopUrl === "https://www.vinbudin.is/heim/vorur") {
-    shopUrl = "https://www.vinbudin.is/heim/vorur/vorur";
-    shopUrlInput.value = shopUrl;
-  }
-
   try {
     compareBtn.disabled = true;
 
@@ -46,8 +37,8 @@ async function handleCompare() {
     const ratedBeers = await parseUntappdCsv(file);
     ratedCountEl.textContent = ratedBeers.length;
 
-    setStatus("Fetching beer shop page...");
-    const siteBeers = await fetchBeersFromSite(shopUrl);
+    setStatus("Fetching Vínbúðin beers...");
+    const siteBeers = await fetchVinbudinBeers();
     siteCountEl.textContent = siteBeers.length;
 
     setStatus("Comparing beers...");
@@ -117,9 +108,13 @@ function parseUntappdCsv(file) {
         const beers = rows
           .map((row) => {
             const beerName = cleanText(row[beerColumn]);
-            const breweryName = breweryColumn ? cleanText(row[breweryColumn]) : "";
+            const breweryName = breweryColumn
+              ? cleanText(row[breweryColumn])
+              : "";
 
-            if (!beerName) return null;
+            if (!beerName) {
+              return null;
+            }
 
             return {
               name: beerName,
@@ -155,266 +150,29 @@ function normalizeHeader(value) {
 }
 
 /* -----------------------------
-   SITE FETCHING
+   VÍNBÚÐIN FETCHING
 ----------------------------- */
 
-async function fetchBeersFromSite(url) {
-  const response = await fetch(
-    `/.netlify/functions/fetch-page?url=${encodeURIComponent(url)}`
-  );
+async function fetchVinbudinBeers() {
+  const response = await fetch("/.netlify/functions/vinbudin-beers");
 
   if (!response.ok) {
-    throw new Error("Could not fetch the beer shop page.");
+    throw new Error("Could not fetch Vínbúðin beer data.");
   }
 
   const data = await response.json();
 
-  if (!data.html) {
-    throw new Error("No HTML received from the beer shop page.");
+  if (!Array.isArray(data.beers)) {
+    throw new Error("Vínbúðin beer data was not in the expected format.");
   }
 
-  return extractBeersFromHtml(data.html, url);
-}
-
-/* -----------------------------
-   HTML PRODUCT EXTRACTION
------------------------------ */
-
-function extractBeersFromHtml(html, pageUrl) {
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(html, "text/html");
-
-  const host = getHost(pageUrl);
-
-  if (host.includes("vinbudin.is")) {
-    return extractVinbudinProducts(doc, pageUrl);
-  }
-
-  return extractGenericShopProducts(doc, pageUrl);
-}
-
-/*
-  Vínbúðin fix:
-  Only collect actual product links.
-
-  Product links usually contain:
-  stoek-vara.aspx/?productid=...
-*/
-function extractVinbudinProducts(doc, pageUrl) {
-  const products = [];
-
-  const productLinks = Array.from(
-    doc.querySelectorAll('a[href*="stoek-vara"], a[href*="productid"]')
-  );
-
-  productLinks.forEach((link) => {
-    const href = link.getAttribute("href");
-    if (!href) return;
-
-    const productUrl = makeAbsoluteUrl(href, pageUrl);
-
-    const productId = getProductId(productUrl);
-    if (!productId) return;
-
-    const container =
-      link.closest("tr") ||
-      link.closest("li") ||
-      link.closest("article") ||
-      link.closest(".product") ||
-      link.closest(".product-item") ||
-      link.closest(".product-list-item") ||
-      link.parentElement;
-
-    const rawText = cleanText(
-      container?.textContent || link.textContent || ""
-    );
-
-    const name = extractVinbudinProductName(rawText, link.textContent, productId);
-
-    if (!name) return;
-
-    const image = findImageNearElement(container || link, pageUrl);
-
-    products.push({
-      name,
-      brewery: "",
-      url: productUrl,
-      image,
-      productId,
-      key: createBeerKey(name, ""),
-      nameKey: normalizeForCompare(name)
-    });
+  return data.beers.map((beer) => {
+    return {
+      ...beer,
+      key: createBeerKey(beer.name, beer.brewery),
+      nameKey: normalizeForCompare(beer.name)
+    };
   });
-
-  return dedupeProducts(products);
-}
-
-function extractVinbudinProductName(containerText, linkText, productId) {
-  let value = cleanText(linkText);
-
-  if (!value || value.length < 3) {
-    value = cleanText(containerText);
-  }
-
-  if (!value) return null;
-
-  /*
-    Remove obvious menu junk.
-  */
-  const lower = value.toLowerCase();
-
-  const badValues = [
-    "loka",
-    "opnunartímar",
-    "vörur",
-    "allar vörur",
-    "bjór",
-    "vefbúð",
-    "leit",
-    "karfa",
-    "innskráning",
-    "forsíða",
-    "næsta síða",
-    "fyrri síða"
-  ];
-
-  if (badValues.includes(lower)) {
-    return null;
-  }
-
-  /*
-    Product names often appear like:
-    Duvel (08114)
-    or inside a longer text block.
-
-    Try to grab the part before product number.
-  */
-  const idPattern = new RegExp(`(.+?)\\(?${escapeRegExp(productId)}\\)?`);
-  const idMatch = value.match(idPattern);
-
-  if (idMatch && idMatch[1]) {
-    value = idMatch[1];
-  }
-
-  /*
-    Remove price, volume, ABV and product number noise.
-  */
-  value = value
-    .replace(/\(\d{4,8}\)/g, "")
-    .replace(/\b\d{4,8}\b/g, "")
-    .replace(/\b\d+[,.]?\d*\s?%.*$/i, "")
-    .replace(/\b\d+\s?(ml|cl|l|lítrar)\b.*$/i, "")
-    .replace(/\b\d+[,.]?\d*\s?kr\.?.*$/i, "")
-    .replace(/\bverð\b.*$/i, "")
-    .replace(/\bprice\b.*$/i, "")
-    .trim();
-
-  /*
-    If the text block has many words from the whole product card,
-    keep only the first line-ish part.
-  */
-  value = value
-    .split("  ")
-    .map(cleanText)
-    .filter(Boolean)[0] || value;
-
-  if (value.length < 3 || value.length > 90) {
-    return null;
-  }
-
-  return value;
-}
-
-/*
-  Fallback for other shops.
-  This is stricter than the old one:
-  it does NOT collect every menu link.
-*/
-function extractGenericShopProducts(doc, pageUrl) {
-  const products = [];
-
-  const productSelectors = [
-    ".product",
-    ".product-card",
-    ".product-item",
-    ".product-list-item",
-    "[class*='product']",
-    "article"
-  ];
-
-  productSelectors.forEach((selector) => {
-    doc.querySelectorAll(selector).forEach((element) => {
-      const text = cleanText(element.textContent);
-      const name = extractGenericProductName(text);
-
-      if (!name) return;
-
-      const url = findClosestLink(element, pageUrl);
-      const image = findImageNearElement(element, pageUrl);
-
-      products.push({
-        name,
-        brewery: "",
-        url,
-        image,
-        key: createBeerKey(name, ""),
-        nameKey: normalizeForCompare(name)
-      });
-    });
-  });
-
-  return dedupeProducts(products);
-}
-
-function extractGenericProductName(text) {
-  let value = cleanText(text);
-
-  if (!value) return null;
-
-  const lower = value.toLowerCase();
-
-  const badWords = [
-    "choose file",
-    "compare beers",
-    "rated beers",
-    "not tasted",
-    "shopping cart",
-    "login",
-    "menu",
-    "search",
-    "privacy",
-    "cookie",
-    "terms",
-    "footer",
-    "header",
-    "opening hours",
-    "opnunartímar"
-  ];
-
-  if (badWords.some((word) => lower.includes(word))) {
-    return null;
-  }
-
-  const lines = value
-    .split(/\n| {2,}/)
-    .map(cleanText)
-    .filter(Boolean);
-
-  if (lines.length) {
-    value = lines[0];
-  }
-
-  value = value
-    .replace(/\b\d+[,.]?\d*\s?%.*$/i, "")
-    .replace(/\b\d+\s?(ml|cl|l)\b.*$/i, "")
-    .replace(/\b\d+[,.]?\d*\s?kr\.?.*$/i, "")
-    .trim();
-
-  if (value.length < 3 || value.length > 90) {
-    return null;
-  }
-
-  return value;
 }
 
 /* -----------------------------
@@ -422,21 +180,33 @@ function extractGenericProductName(text) {
 ----------------------------- */
 
 function findNotTastedBeers(siteBeers, ratedBeers) {
-  const ratedNameKeys = new Set(ratedBeers.map((beer) => beer.nameKey));
-  const ratedFullKeys = new Set(ratedBeers.map((beer) => beer.key));
-
   return siteBeers.filter((siteBeer) => {
-    if (ratedNameKeys.has(siteBeer.nameKey)) return false;
-    if (ratedFullKeys.has(siteBeer.key)) return false;
-
     const siteName = siteBeer.nameKey;
+
+    if (!siteName) {
+      return false;
+    }
 
     const closeMatch = ratedBeers.some((ratedBeer) => {
       const ratedName = ratedBeer.nameKey;
 
-      if (!ratedName || !siteName) return false;
+      if (!ratedName) {
+        return false;
+      }
 
-      return ratedName.includes(siteName) || siteName.includes(ratedName);
+      if (ratedName === siteName) {
+        return true;
+      }
+
+      if (ratedName.includes(siteName)) {
+        return true;
+      }
+
+      if (siteName.includes(ratedName)) {
+        return true;
+      }
+
+      return similarityScore(ratedName, siteName) >= 0.86;
     });
 
     return !closeMatch;
@@ -452,7 +222,7 @@ function renderResults(beers) {
 
   if (!beers.length) {
     resultsEl.innerHTML =
-      `<p class="empty">No new beers found. Either you have tasted them all, or the page did not expose product data.</p>`;
+      `<p class="empty">No new beers found. Either you have tasted them all, or matching was too aggressive.</p>`;
     return;
   }
 
@@ -464,15 +234,21 @@ function renderResults(beers) {
       ? `<img src="${escapeHtml(beer.image)}" alt="${escapeHtml(beer.name)}" loading="lazy" />`
       : `<div class="missing-image">No image</div>`;
 
+    const details = [
+      beer.brewery,
+      beer.style,
+      beer.abv ? `${beer.abv}%` : "",
+      beer.volume ? `${beer.volume} ml` : "",
+      beer.price ? `${beer.price} kr.` : ""
+    ]
+      .filter(Boolean)
+      .join(" · ");
+
     card.innerHTML = `
       ${imageHtml}
       <div class="beer-info">
         <h3>${escapeHtml(beer.name)}</h3>
-        ${
-          beer.brewery
-            ? `<p>${escapeHtml(beer.brewery)}</p>`
-            : `<p>Found on beer shop page</p>`
-        }
+        <p>${escapeHtml(details || "Vínbúðin beer")}</p>
         <a href="${escapeHtml(beer.url)}" target="_blank" rel="noopener noreferrer">
           Open product
         </a>
@@ -484,95 +260,8 @@ function renderResults(beers) {
 }
 
 /* -----------------------------
-   HELPERS
+   NORMALIZATION
 ----------------------------- */
-
-function dedupeProducts(products) {
-  const seen = new Set();
-  const unique = [];
-
-  products.forEach((product) => {
-    const key = product.productId || product.nameKey;
-
-    if (!key || seen.has(key)) return;
-
-    seen.add(key);
-    unique.push(product);
-  });
-
-  return unique;
-}
-
-function getProductId(url) {
-  try {
-    const parsed = new URL(url);
-    const productId = parsed.searchParams.get("productid");
-
-    if (productId) {
-      return productId.replace(/\D/g, "");
-    }
-
-    const match = url.match(/productid=([0-9]+)/i);
-    return match ? match[1] : "";
-  } catch {
-    const match = String(url).match(/productid=([0-9]+)/i);
-    return match ? match[1] : "";
-  }
-}
-
-function findClosestLink(element, pageUrl) {
-  const linkElement = element.closest?.("a") || element.querySelector?.("a");
-
-  if (!linkElement) {
-    return pageUrl;
-  }
-
-  const href = linkElement.getAttribute("href");
-
-  if (!href) {
-    return pageUrl;
-  }
-
-  return makeAbsoluteUrl(href, pageUrl);
-}
-
-function findImageNearElement(element, pageUrl) {
-  if (!element) return "";
-
-  const img =
-    element.querySelector?.("img") ||
-    element.closest?.("article")?.querySelector?.("img") ||
-    element.closest?.(".product")?.querySelector?.("img") ||
-    element.closest?.(".product-item")?.querySelector?.("img");
-
-  if (!img) return "";
-
-  const src =
-    img.getAttribute("src") ||
-    img.getAttribute("data-src") ||
-    img.getAttribute("data-lazy-src") ||
-    img.getAttribute("data-original");
-
-  if (!src) return "";
-
-  return makeAbsoluteUrl(src, pageUrl);
-}
-
-function makeAbsoluteUrl(value, baseUrl) {
-  try {
-    return new URL(value, baseUrl).href;
-  } catch {
-    return baseUrl;
-  }
-}
-
-function getHost(url) {
-  try {
-    return new URL(url).hostname.toLowerCase();
-  } catch {
-    return "";
-  }
-}
 
 function createBeerKey(name, brewery) {
   return normalizeForCompare(`${name} ${brewery || ""}`);
@@ -588,7 +277,10 @@ function normalizeForCompare(value) {
     .replace(/æ/g, "ae")
     .replace(/ö/g, "o")
     .replace(/[^a-z0-9]+/g, " ")
-    .replace(/\b(beer|ale|lager|ipa|stout|porter|can|bottle|draught|dose|flaska)\b/g, "")
+    .replace(
+      /\b(beer|ale|lager|ipa|neipa|dipa|stout|porter|can|bottle|draught|dose|flaska|bjor|nr)\b/g,
+      ""
+    )
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -598,6 +290,55 @@ function cleanText(value) {
     .replace(/\s+/g, " ")
     .trim();
 }
+
+/* -----------------------------
+   FUZZY MATCHING
+----------------------------- */
+
+function similarityScore(a, b) {
+  const longer = a.length > b.length ? a : b;
+  const shorter = a.length > b.length ? b : a;
+
+  if (!longer.length) {
+    return 1;
+  }
+
+  const distance = levenshteinDistance(longer, shorter);
+
+  return (longer.length - distance) / longer.length;
+}
+
+function levenshteinDistance(a, b) {
+  const matrix = [];
+
+  for (let i = 0; i <= b.length; i++) {
+    matrix[i] = [i];
+  }
+
+  for (let j = 0; j <= a.length; j++) {
+    matrix[0][j] = j;
+  }
+
+  for (let i = 1; i <= b.length; i++) {
+    for (let j = 1; j <= a.length; j++) {
+      if (b.charAt(i - 1) === a.charAt(j - 1)) {
+        matrix[i][j] = matrix[i - 1][j - 1];
+      } else {
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j - 1] + 1,
+          matrix[i][j - 1] + 1,
+          matrix[i - 1][j] + 1
+        );
+      }
+    }
+  }
+
+  return matrix[b.length][a.length];
+}
+
+/* -----------------------------
+   UI HELPERS
+----------------------------- */
 
 function clearResults() {
   ratedCountEl.textContent = "0";
@@ -628,8 +369,4 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
-}
-
-function escapeRegExp(value) {
-  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
