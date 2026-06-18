@@ -1,5 +1,35 @@
 const cheerio = require("cheerio");
 
+function extractUntappdBeers(rows) {
+  return rows
+    .map(row => {
+      const beer =
+        row.beer_name ||
+        row["Beer Name"] ||
+        row.beer ||
+        row.Name ||
+        row.name;
+
+      const brewery =
+        row.brewery_name ||
+        row["Brewery Name"] ||
+        row.brewery ||
+        row.Brewery;
+
+      if (!beer) return null;
+
+      return {
+        beerName: beer.trim(),
+        breweryName: brewery ? brewery.trim() : "",
+        searchKey: `${beer} ${brewery || ""}`
+          .toLowerCase()
+          .replace(/[^\w\s]/g, "")
+          .trim()
+      };
+    })
+    .filter(Boolean);
+}
+
 function absoluteUrl(value, baseUrl) {
   if (!value) return "";
   try {
